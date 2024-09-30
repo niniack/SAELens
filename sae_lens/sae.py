@@ -32,7 +32,7 @@ SAE_WEIGHTS_PATH = "sae_weights.safetensors"
 SAE_CFG_PATH = "cfg.json"
 
 
-@dataclass
+@dataclass(kw_only=True)
 class SAEConfig:
     # architecture details
     architecture: Literal["standard", "gated", "jumprelu"]
@@ -109,6 +109,16 @@ class SAEConfig:
             "neuronpedia_id": self.neuronpedia_id,
             "model_from_pretrained_kwargs": self.model_from_pretrained_kwargs,
         }
+
+@dataclass
+class TranscoderConfig(SAEConfig):
+    # transcoder-specific forward pass details
+    d_out: int
+
+    # transcoder-specific dataset details
+    hook_name_out: str
+    hook_layer_out: int
+    hook_head_index_out: Optional[int]
 
 
 class SAE(HookedRootModule):
@@ -485,12 +495,13 @@ class SAE(HookedRootModule):
         return self.hook_sae_output(sae_out)
 
     def encode_gated(
-        self, x: Float[torch.Tensor, "... d_in"]
+        self, x: Float[torch.Tensor, "... d_in"], apply_hooks: bool = True
     ) -> Float[torch.Tensor, "... d_sae"]:
 
         x = x.to(self.dtype)
         x = self.reshape_fn_in(x)
-        x = self.hook_sae_input(x)
+        if apply_hooks:
+            x = self.hook_sae_input(x)
         x = self.run_time_activation_norm_fn_in(x)
         sae_in = x - self.b_dec * self.cfg.apply_b_dec_to_input
 
@@ -499,17 +510,19 @@ class SAE(HookedRootModule):
         active_features = (gating_pre_activation > 0).to(self.dtype)
 
         # Magnitude path with weight sharing
-        magnitude_pre_activation = self.hook_sae_acts_pre(
-            sae_in @ (self.W_enc * self.r_mag.exp()) + self.b_mag
-        )
+        magnitude_pre_activation = sae_in @ (self.W_enc * self.r_mag.exp()) + self.b_mag
+        if apply_hooks:
+            magnitude_pre_activation = self.hook_sae_acts_pre(magnitude_pre_activation)
+        
         feature_magnitudes = self.activation_fn(magnitude_pre_activation)
 
-        feature_acts = self.hook_sae_acts_post(active_features * feature_magnitudes)
-
+        feature_acts = active_features * feature_magnitudes
+        if apply_hooks:
+            feature_acts = self.hook_sae_acts_post(feature_acts)
         return feature_acts
 
     def encode_jumprelu(
-        self, x: Float[torch.Tensor, "... d_in"]
+        self, x: Float[torch.Tensor, "... d_in"], apply_hooks: bool = True
     ) -> Float[torch.Tensor, "... d_sae"]:
         """
         Calculate SAE features from inputs
@@ -525,19 +538,24 @@ class SAE(HookedRootModule):
         x = self.run_time_activation_norm_fn_in(x)
 
         # apply b_dec_to_input if using that method.
-        sae_in = self.hook_sae_input(x - (self.b_dec * self.cfg.apply_b_dec_to_input))
+        sae_in = x - (self.b_dec * self.cfg.apply_b_dec_to_input)
+        if apply_hooks:
+            sae_in = self.hook_sae_input(sae_in)
 
         # "... d_in, d_in d_sae -> ... d_sae",
-        hidden_pre = self.hook_sae_acts_pre(sae_in @ self.W_enc + self.b_enc)
+        hidden_pre = sae_in @ self.W_enc + self.b_enc
+        if apply_hooks:
+            hidden_pre = self.hook_sae_acts_pre(hidden_pre)
 
-        feature_acts = self.hook_sae_acts_post(
-            self.activation_fn(hidden_pre) * (hidden_pre > self.threshold)
-        )
+        feature_acts = self.activation_fn(hidden_pre) * (hidden_pre > self.threshold)
+        if apply_hooks:
+            feature_acts = self.hook_sae_acts_post(feature_acts)
+
 
         return feature_acts
 
     def encode_standard(
-        self, x: Float[torch.Tensor, "... d_in"]
+        self, x: Float[torch.Tensor, "... d_in"], apply_hooks: bool = True
     ) -> Float[torch.Tensor, "... d_sae"]:
         """
         Calculate SAE features from inputs
@@ -545,27 +563,32 @@ class SAE(HookedRootModule):
 
         x = x.to(self.dtype)
         x = self.reshape_fn_in(x)
-        x = self.hook_sae_input(x)
+        if apply_hooks:
+            x = self.hook_sae_input(x)
         x = self.run_time_activation_norm_fn_in(x)
 
         # apply b_dec_to_input if using that method.
         sae_in = x - (self.b_dec * self.cfg.apply_b_dec_to_input)
 
         # "... d_in, d_in d_sae -> ... d_sae",
-        hidden_pre = self.hook_sae_acts_pre(sae_in @ self.W_enc + self.b_enc)
-        feature_acts = self.hook_sae_acts_post(self.activation_fn(hidden_pre))
+        hidden_pre = sae_in @ self.W_enc + self.b_enc
+        if apply_hooks:
+            hidden_pre = self.hook_sae_acts_pre(hidden_pre)
+        
+        feature_acts = self.activation_fn(hidden_pre)
+        if apply_hooks:
+            feature_acts = self.hook_sae_acts_post(feature_acts)
 
         return feature_acts
 
     def decode(
-        self, feature_acts: Float[torch.Tensor, "... d_sae"]
+        self, feature_acts: Float[torch.Tensor, "... d_sae"], apply_hooks: bool = True
     ) -> Float[torch.Tensor, "... d_in"]:
         """Decodes SAE feature activation tensor into a reconstructed input activation tensor."""
         # "... d_sae, d_sae d_in -> ... d_in",
-        sae_out = self.hook_sae_recons(
-            self.apply_finetuning_scaling_factor(feature_acts) @ self.W_dec + self.b_dec
-        )
-
+        sae_out = self.get_sae_recons(feature_acts)
+        if apply_hooks:
+            sae_out = self.hook_sae_recons(sae_out)
         # handle run time activation normalization if needed
         # will fail if you call this twice without calling encode in between.
         sae_out = self.run_time_activation_norm_fn_out(sae_out)
@@ -574,6 +597,13 @@ class SAE(HookedRootModule):
         sae_out = self.reshape_fn_out(sae_out, self.d_head)  # type: ignore
 
         return sae_out
+
+    def get_sae_recons(
+        self, feature_acts: Float[torch.Tensor, "... d_sae"]
+    ) -> Float[torch.Tensor, "... d_in"]:
+        return (
+            self.apply_finetuning_scaling_factor(feature_acts) @ self.W_dec + self.b_dec
+        )
 
     @torch.no_grad()
     def fold_W_dec_norm(self):
@@ -818,3 +848,41 @@ def get_activation_fn(
         return TopK(k, postact_fn)
     else:
         raise ValueError(f"Unknown activation function: {activation_fn}")
+
+
+class Transcoder(SAE):
+    """A variant of sparse autoencoders that have different input and output hook points."""
+
+    cfg: TranscoderConfig  # type: ignore
+    dtype: torch.dtype
+    device: torch.device
+
+    def __init__(
+        self,
+        cfg: TranscoderConfig,
+        use_error_term: bool = False,
+    ):
+        assert isinstance(
+            cfg, TranscoderConfig
+        ), f"Expected TranscoderConfig, got {cfg}"
+        if use_error_term:
+            raise NotImplementedError("Error term not yet supported for Transcoder")
+        super().__init__(cfg, use_error_term)
+
+    def initialize_weights_basic(self):
+        super().initialize_weights_basic()
+
+        # NOTE: Transcoders have an additional b_dec_out parameter.
+        # Reference: https://github.com/jacobdunefsky/transcoder_circuits/blob/7b44d870a5a301ef29eddfd77cb1f4dca854760a/sae_training/sparse_autoencoder.py#L93C1-L97C14
+        self.b_dec_out = nn.Parameter(
+            torch.zeros(self.cfg.d_out, dtype=self.dtype, device=self.device)
+        )
+
+    def get_sae_recons(
+        self, feature_acts: Float[torch.Tensor, "... d_sae"]
+    ) -> Float[torch.Tensor, "... d_out"]:
+        # NOTE: b_dec_out instead of b_dec
+        return (
+            self.apply_finetuning_scaling_factor(feature_acts) @ self.W_dec
+            + self.b_dec_out
+        )

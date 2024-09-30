@@ -423,6 +423,28 @@ class LanguageModelSAERunnerConfig:
 
 
 @dataclass
+class LanguageModelTranscoderRunnerConfig(LanguageModelSAERunnerConfig):
+    d_out: int = 512
+    hook_name_out: str = "blocks.0.hook_mlp_out"
+    hook_layer_out: int = 0
+    hook_head_index_out: Optional[int] = None
+
+    def get_base_sae_cfg_dict(self) -> dict[str, Any]:
+        """Returns the config for the base Transcoder."""
+        return {
+            **super().get_base_sae_cfg_dict(),
+            "d_out": self.d_out,
+            "hook_name_out": self.hook_name_out,
+            "hook_layer_out": self.hook_layer_out,
+            "hook_head_index_out": self.hook_head_index_out,
+        }
+    
+    def __post_init__(self):
+        assert self.d_in == self.d_out, "`d_in` must be equal to `d_out` for a Transcoder!"
+
+        assert self.hook_layer == self.hook_layer_out, "`hook_layer` must be equal to `hook_layer_out` for a Transcoder!"
+
+@dataclass
 class CacheActivationsRunnerConfig:
     """
     Configuration for caching activations of an LLM.
